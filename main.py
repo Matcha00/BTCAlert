@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from utils.bitmex import (
     BitmexAPIError,
     get_bucketed_trades,
+    get_btc_usd_price,
     get_current_bvol_value,
     get_instrument,
     get_historical_closes,
@@ -136,6 +137,19 @@ def format_int(value: int | float | None) -> str:
     if value is None:
         return "N/A"
     return f"{value:,.0f}"
+
+
+def format_usd(value: int | float | None) -> str:
+    if value is None:
+        return "N/A"
+    number = float(value)
+    sign = "-" if number < 0 else ""
+    abs_value = abs(number)
+    if abs_value >= 1_000_000_000:
+        return f"{sign}${abs_value / 1_000_000_000:,.2f}B"
+    if abs_value >= 1_000_000:
+        return f"{sign}${abs_value / 1_000_000:,.2f}M"
+    return f"{sign}${abs_value:,.0f}"
 
 
 def get_last_alert_key(state: dict, monitor: str) -> str | None:
@@ -413,28 +427,53 @@ def build_cftc_oi_message(
     latest: COTOpenInterestPoint,
     lookback_weeks: int,
     mean_open_interest: float,
+    mean_notional_btc: float,
     multiplier: float,
-    absolute_threshold: float | None,
+    btc_price: float,
+    btc_price_source: str,
+    contract_threshold: float | None,
+    btc_threshold: float | None,
+    usd_threshold: float | None,
     reasons: list[str],
     utc_now: datetime,
     beijing_now: datetime,
 ) -> str:
     diff = latest.open_interest - mean_open_interest
     diff_pct = diff / mean_open_interest * 100 if mean_open_interest else 0.0
+    notional_btc = latest.notional_btc
+    mean_notional_usd = mean_notional_btc * btc_price
+    notional_usd = notional_btc * btc_price
+    weekly_change_btc = latest.weekly_change_btc
+    weekly_change_usd = weekly_change_btc * btc_price if weekly_change_btc is not None else None
     reason_text = "\n".join(f"- {reason}" for reason in reasons)
     threshold_text = format_int(mean_open_interest * multiplier)
-    absolute_text = format_int(absolute_threshold) if absolute_threshold is not None else "未设置"
+    mean_btc_threshold_text = format_int(mean_notional_btc * multiplier)
+    contract_threshold_text = (
+        format_int(contract_threshold) if contract_threshold is not None else "未设置"
+    )
+    btc_threshold_text = format_int(btc_threshold) if btc_threshold is not None else "未设置"
+    usd_threshold_text = format_usd(usd_threshold) if usd_threshold is not None else "未设置"
 
     return (
         "🔴 *CME BTC 持仓量预警*\n\n"
         "指标：CFTC COT / CME Bitcoin Futures Open Interest\n"
         f"报告日期：{latest.report_date.isoformat()}\n"
         f"当前 OI：{format_int(latest.open_interest)} 张\n"
-        f"{lookback_weeks}周均值：{format_int(mean_open_interest)} 张\n"
-        f"均值触发线：{threshold_text} 张（均值 x {multiplier:.2f}）\n"
-        f"绝对阈值：{absolute_text}\n"
+        f"合约单位：{latest.contract_units}\n"
+        f"折合 BTC：{format_int(notional_btc)} BTC\n"
+        f"折合美元：{format_usd(notional_usd)}\n"
+        f"BTCUSD：{format_usd(btc_price)}（{btc_price_source}）\n\n"
+        f"{lookback_weeks}周均值：{format_int(mean_open_interest)} 张 / "
+        f"{format_int(mean_notional_btc)} BTC / {format_usd(mean_notional_usd)}\n"
+        f"均值触发线：{threshold_text} 张 / {mean_btc_threshold_text} BTC"
+        f"（均值 x {multiplier:.2f}）\n"
+        f"固定张数阈值：{contract_threshold_text}\n"
+        f"固定 BTC 阈值：{btc_threshold_text}\n"
+        f"固定 USD 阈值：{usd_threshold_text}\n"
         f"偏离均值：{format_signed_number(diff, 0)} 张（{diff_pct:+.1f}%）\n"
-        f"周变化：{format_signed_number(latest.weekly_change, 0)} 张\n\n"
+        f"周变化：{format_signed_number(latest.weekly_change, 0)} 张 / "
+        f"{format_signed_number(weekly_change_btc, 0)} BTC / "
+        f"{format_usd(weekly_change_usd)}\n\n"
         "检查时间：\n"
         f"UTC：{format_dt(utc_now)}\n"
         f"北京时间：{format_dt(beijing_now)}\n\n"
@@ -470,10 +509,16 @@ def run_cftc_btc_oi_monitor(
         mean_multiplier = parse_float_env(
             "CFTC_BTC_OI_MEAN_MULTIPLIER", DEFAULT_CFTC_BTC_OI_MEAN_MULTIPLIER
         )
-        absolute_threshold = parse_optional_float_env("CFTC_BTC_OI_ABSOLUTE_THRESHOLD")
+        contract_threshold = parse_optional_float_env("CFTC_BTC_OI_CONTRACT_THRESHOLD")
+        legacy_contract_threshold = parse_optional_float_env("CFTC_BTC_OI_ABSOLUTE_THRESHOLD")
+        btc_threshold = parse_optional_float_env("CFTC_BTC_OI_BTC_THRESHOLD")
+        usd_threshold = parse_optional_float_env("CFTC_BTC_OI_USD_THRESHOLD")
     except ValueError:
         logger.exception("Invalid CFTC BTC OI threshold configuration.")
         return 2
+
+    if contract_threshold is None:
+        contract_threshold = legacy_contract_threshold
 
     if lookback_weeks < 1 or min_history_weeks < 1 or mean_multiplier <= 0:
         logger.error("Invalid CFTC BTC OI configuration values.")
@@ -497,25 +542,43 @@ def run_cftc_btc_oi_monitor(
         return 0
 
     mean_open_interest = calculate_mean([point.open_interest for point in previous_points])
+    mean_notional_btc = calculate_mean([point.notional_btc for point in previous_points])
     mean_threshold = mean_open_interest * mean_multiplier
+
+    try:
+        btc_price, btc_price_source = get_btc_usd_price()
+    except BitmexAPIError:
+        logger.exception("Failed to fetch BTCUSD price for CFTC BTC OI notional conversion.")
+        return 1
+
+    current_notional_btc = latest.notional_btc
+    current_notional_usd = current_notional_btc * btc_price
     reasons: list[str] = []
     if latest.open_interest > mean_threshold:
         reasons.append(
-            f"当前 OI > {lookback_weeks}周均值 x {mean_multiplier:.2f}"
+            f"当前 BTC 名义持仓 > {lookback_weeks}周均值 x {mean_multiplier:.2f}"
         )
-    if absolute_threshold is not None and latest.open_interest >= absolute_threshold:
-        reasons.append(f"当前 OI >= 绝对阈值 {format_int(absolute_threshold)}")
+    if contract_threshold is not None and latest.open_interest >= contract_threshold:
+        reasons.append(f"当前 OI 张数 >= 固定阈值 {format_int(contract_threshold)} 张")
+    if btc_threshold is not None and current_notional_btc >= btc_threshold:
+        reasons.append(f"当前 BTC 名义持仓 >= 固定阈值 {format_int(btc_threshold)} BTC")
+    if usd_threshold is not None and current_notional_usd >= usd_threshold:
+        reasons.append(f"当前 USD 名义持仓 >= 固定阈值 {format_usd(usd_threshold)}")
 
     logger.info(
         (
             "CFTC BTC OI result | report_date=%s | current=%s | weekly_change=%s | "
-            "lookback_weeks=%s | mean=%.2f | multiplier=%.2f | reasons=%s"
+            "lookback_weeks=%s | mean=%.2f | notional_btc=%.2f | "
+            "notional_usd=%.2f | btc_price=%.2f | multiplier=%.2f | reasons=%s"
         ),
         latest.report_date.isoformat(),
         latest.open_interest,
         latest.weekly_change,
         lookback_weeks,
         mean_open_interest,
+        current_notional_btc,
+        current_notional_usd,
+        btc_price,
         mean_multiplier,
         reasons,
     )
@@ -534,8 +597,13 @@ def run_cftc_btc_oi_monitor(
         latest=latest,
         lookback_weeks=lookback_weeks,
         mean_open_interest=mean_open_interest,
+        mean_notional_btc=mean_notional_btc,
         multiplier=mean_multiplier,
-        absolute_threshold=absolute_threshold,
+        btc_price=btc_price,
+        btc_price_source=btc_price_source,
+        contract_threshold=contract_threshold,
+        btc_threshold=btc_threshold,
+        usd_threshold=usd_threshold,
         reasons=reasons,
         utc_now=utc_now,
         beijing_now=beijing_now,
@@ -555,10 +623,19 @@ def run_cftc_btc_oi_monitor(
             "report_date": alert_key,
             "open_interest": latest.open_interest,
             "weekly_change": latest.weekly_change,
+            "contract_units": latest.contract_units,
+            "contract_size_btc": latest.contract_size_btc,
+            "notional_btc": current_notional_btc,
+            "notional_usd": current_notional_usd,
+            "btc_price": btc_price,
+            "btc_price_source": btc_price_source,
             "lookback_weeks": lookback_weeks,
             "mean_open_interest": mean_open_interest,
+            "mean_notional_btc": mean_notional_btc,
             "mean_multiplier": mean_multiplier,
-            "absolute_threshold": absolute_threshold,
+            "contract_threshold": contract_threshold,
+            "btc_threshold": btc_threshold,
+            "usd_threshold": usd_threshold,
             "reasons": reasons,
         },
     )

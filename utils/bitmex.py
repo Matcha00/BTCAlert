@@ -8,6 +8,7 @@ import requests
 BASE_URL = "https://www.bitmex.com/api/v1"
 TIMEOUT_SECONDS = 10
 PRICE_FALLBACK_FIELDS = ("lastPrice", "markPrice", "indicativeSettlePrice")
+BTC_PRICE_FIELDS = ("lastPrice", "markPrice", "indicativeSettlePrice", "fairPrice")
 
 
 class BitmexAPIError(RuntimeError):
@@ -89,6 +90,28 @@ def _instrument_fallback_price(instrument: dict[str, Any]) -> tuple[float, str] 
         if value is not None:
             return value, field
     return None
+
+
+def get_instrument_price(
+    symbol: str,
+    price_fields: tuple[str, ...] = BTC_PRICE_FIELDS,
+) -> tuple[float, str]:
+    instrument = get_instrument(symbol=symbol)
+    for field in price_fields:
+        value = _as_float(instrument.get(field))
+        if value is not None:
+            return value, f"{symbol}.{field}"
+    raise BitmexAPIError(f"No usable price found for BitMEX instrument: {symbol}")
+
+
+def get_btc_usd_price() -> tuple[float, str]:
+    errors: list[str] = []
+    for symbol in (".BXBT", "XBTUSD"):
+        try:
+            return get_instrument_price(symbol=symbol)
+        except BitmexAPIError as exc:
+            errors.append(str(exc))
+    raise BitmexAPIError("Unable to fetch BTCUSD price from BitMEX: " + " | ".join(errors))
 
 
 def get_current_bvol_value(
