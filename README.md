@@ -149,7 +149,7 @@ CFTC Contract Market Code: 133741
 - 根据 CFTC 的 `Contract Units` 自动把张数换算成 BTC 名义持仓。
 - 使用 BitMEX `.BXBT` 指数价格把 BTC 名义持仓换算成 USD。
 - 当前 BTC 名义持仓大于 `52周均值 x 1.0` 时触发。
-- 也可以额外设置固定 BTC 或 USD 阈值。
+- 也可以设置固定 BTC 高位/低位阈值，或固定 USD 阈值。
 - 同一个 COT 报告日期只推送一次。
 
 可以在 `.env` 修改：
@@ -158,9 +158,11 @@ CFTC Contract Market Code: 133741
 ENABLE_CFTC_BTC_OI=true
 CFTC_BTC_OI_LOOKBACK_WEEKS=52
 CFTC_BTC_OI_MIN_HISTORY_WEEKS=8
+ENABLE_CFTC_BTC_OI_MEAN_ALERT=true
 CFTC_BTC_OI_MEAN_MULTIPLIER=1.0
 CFTC_BTC_OI_CONTRACT_THRESHOLD=
 CFTC_BTC_OI_BTC_THRESHOLD=
+CFTC_BTC_OI_BTC_LOW_THRESHOLD=
 CFTC_BTC_OI_USD_THRESHOLD=
 ```
 
@@ -174,6 +176,18 @@ CFTC_BTC_OI_MEAN_MULTIPLIER=1.1
 
 ```bash
 CFTC_BTC_OI_BTC_THRESHOLD=150000
+```
+
+如果你希望“跌破一个固定 BTC 名义持仓才报警”，设置低位 BTC 阈值：
+
+```bash
+CFTC_BTC_OI_BTC_LOW_THRESHOLD=100000
+```
+
+如果你只想使用固定高低阈值，不想使用 52 周均值报警：
+
+```bash
+ENABLE_CFTC_BTC_OI_MEAN_ALERT=false
 ```
 
 如果你希望“突破一个固定美元名义持仓才报警”，设置 USD 阈值：
@@ -336,7 +350,8 @@ BTCUSD：$75,591（.BXBT.lastPrice）
 52周均值：26,152 张 / 130,760 BTC / $9.88B
 均值触发线：26,152 张 / 130,760 BTC（均值 x 1.00）
 固定张数阈值：未设置
-固定 BTC 阈值：未设置
+固定 BTC 高位阈值：150,000
+固定 BTC 低位阈值：100,000
 固定 USD 阈值：未设置
 偏离均值：-3,152 张（-12.1%）
 周变化：-535 张 / -2,675 BTC / -$202.20M

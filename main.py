@@ -433,6 +433,7 @@ def build_cftc_oi_message(
     btc_price_source: str,
     contract_threshold: float | None,
     btc_threshold: float | None,
+    btc_low_threshold: float | None,
     usd_threshold: float | None,
     reasons: list[str],
     utc_now: datetime,
@@ -452,7 +453,21 @@ def build_cftc_oi_message(
         format_int(contract_threshold) if contract_threshold is not None else "未设置"
     )
     btc_threshold_text = format_int(btc_threshold) if btc_threshold is not None else "未设置"
+    btc_low_threshold_text = (
+        format_int(btc_low_threshold) if btc_low_threshold is not None else "未设置"
+    )
     usd_threshold_text = format_usd(usd_threshold) if usd_threshold is not None else "未设置"
+    is_low_alert = any("低位阈值" in reason for reason in reasons)
+    status_text = (
+        "CME BTC 期货未平仓合约跌入低位区间，说明机构级期货市场敞口收缩，后续需要警惕低流动性下的波动放大。"
+        if is_low_alert
+        else "CME BTC 期货未平仓合约高于设定阈值，说明机构级期货市场参与度和杠杆敞口偏热。"
+    )
+    risk_text = (
+        "OI 低位本身不判断方向，但可能意味着市场参与度下降；若后续价格突破伴随 OI 回升，需要警惕趋势重新启动。"
+        if is_low_alert
+        else "OI 升高本身不判断方向，但常意味着后续波动、挤仓或趋势延续风险上升，请结合价格、资金费率和波动率一起看。"
+    )
 
     return (
         "🔴 *CME BTC 持仓量预警*\n\n"
@@ -468,7 +483,8 @@ def build_cftc_oi_message(
         f"均值触发线：{threshold_text} 张 / {mean_btc_threshold_text} BTC"
         f"（均值 x {multiplier:.2f}）\n"
         f"固定张数阈值：{contract_threshold_text}\n"
-        f"固定 BTC 阈值：{btc_threshold_text}\n"
+        f"固定 BTC 高位阈值：{btc_threshold_text}\n"
+        f"固定 BTC 低位阈值：{btc_low_threshold_text}\n"
         f"固定 USD 阈值：{usd_threshold_text}\n"
         f"偏离均值：{format_signed_number(diff, 0)} 张（{diff_pct:+.1f}%）\n"
         f"周变化：{format_signed_number(latest.weekly_change, 0)} 张 / "
@@ -480,9 +496,9 @@ def build_cftc_oi_message(
         "触发原因：\n"
         f"{reason_text}\n\n"
         "状态判断：\n"
-        "CME BTC 期货未平仓合约高于历史均值，说明机构级期货市场参与度和杠杆敞口偏热。\n\n"
+        f"{status_text}\n\n"
         "风险提示：\n"
-        "OI 升高本身不判断方向，但常意味着后续波动、挤仓或趋势延续风险上升，请结合价格、资金费率和波动率一起看。"
+        f"{risk_text}"
     )
 
 
@@ -506,12 +522,14 @@ def run_cftc_btc_oi_monitor(
         min_history_weeks = parse_int_env(
             "CFTC_BTC_OI_MIN_HISTORY_WEEKS", DEFAULT_CFTC_BTC_OI_MIN_HISTORY_WEEKS
         )
+        enable_mean_alert = parse_bool_env("ENABLE_CFTC_BTC_OI_MEAN_ALERT", True)
         mean_multiplier = parse_float_env(
             "CFTC_BTC_OI_MEAN_MULTIPLIER", DEFAULT_CFTC_BTC_OI_MEAN_MULTIPLIER
         )
         contract_threshold = parse_optional_float_env("CFTC_BTC_OI_CONTRACT_THRESHOLD")
         legacy_contract_threshold = parse_optional_float_env("CFTC_BTC_OI_ABSOLUTE_THRESHOLD")
         btc_threshold = parse_optional_float_env("CFTC_BTC_OI_BTC_THRESHOLD")
+        btc_low_threshold = parse_optional_float_env("CFTC_BTC_OI_BTC_LOW_THRESHOLD")
         usd_threshold = parse_optional_float_env("CFTC_BTC_OI_USD_THRESHOLD")
     except ValueError:
         logger.exception("Invalid CFTC BTC OI threshold configuration.")
@@ -554,7 +572,7 @@ def run_cftc_btc_oi_monitor(
     current_notional_btc = latest.notional_btc
     current_notional_usd = current_notional_btc * btc_price
     reasons: list[str] = []
-    if latest.open_interest > mean_threshold:
+    if enable_mean_alert and latest.open_interest > mean_threshold:
         reasons.append(
             f"当前 BTC 名义持仓 > {lookback_weeks}周均值 x {mean_multiplier:.2f}"
         )
@@ -562,6 +580,8 @@ def run_cftc_btc_oi_monitor(
         reasons.append(f"当前 OI 张数 >= 固定阈值 {format_int(contract_threshold)} 张")
     if btc_threshold is not None and current_notional_btc >= btc_threshold:
         reasons.append(f"当前 BTC 名义持仓 >= 固定阈值 {format_int(btc_threshold)} BTC")
+    if btc_low_threshold is not None and current_notional_btc <= btc_low_threshold:
+        reasons.append(f"当前 BTC 名义持仓 <= 低位阈值 {format_int(btc_low_threshold)} BTC")
     if usd_threshold is not None and current_notional_usd >= usd_threshold:
         reasons.append(f"当前 USD 名义持仓 >= 固定阈值 {format_usd(usd_threshold)}")
 
@@ -603,6 +623,7 @@ def run_cftc_btc_oi_monitor(
         btc_price_source=btc_price_source,
         contract_threshold=contract_threshold,
         btc_threshold=btc_threshold,
+        btc_low_threshold=btc_low_threshold,
         usd_threshold=usd_threshold,
         reasons=reasons,
         utc_now=utc_now,
@@ -632,9 +653,11 @@ def run_cftc_btc_oi_monitor(
             "lookback_weeks": lookback_weeks,
             "mean_open_interest": mean_open_interest,
             "mean_notional_btc": mean_notional_btc,
+            "enable_mean_alert": enable_mean_alert,
             "mean_multiplier": mean_multiplier,
             "contract_threshold": contract_threshold,
             "btc_threshold": btc_threshold,
+            "btc_low_threshold": btc_low_threshold,
             "usd_threshold": usd_threshold,
             "reasons": reasons,
         },

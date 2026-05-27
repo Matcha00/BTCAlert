@@ -27,9 +27,11 @@ rsync -avz --delete \
   --exclude='logs' \
   --exclude='__pycache__' \
   --exclude='.env' \
+  --exclude='state.json' \
   "$LOCAL_DIR/" "$REMOTE:$REMOTE_DIR/"
 
 "${SSH_CMD[@]}" "$REMOTE" "cd '$REMOTE_DIR' && \
+  test -f state.json || printf '{\n  \"last_alert_date\": null\n}\n' > state.json && \
   '$REMOTE_PYTHON_BIN' -m venv .venv && \
   ./.venv/bin/python -m pip install --upgrade pip && \
   ./.venv/bin/pip install -r requirements.txt && \
