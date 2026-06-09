@@ -1,12 +1,13 @@
 # BTC 风险预警机器人
 
-每天北京时间 08:30 检查 BitMEX `.BVOL7D` 指数，以及 CFTC/CME Bitcoin futures open interest。满足任意预警条件时，通过 Telegram Bot 推送消息，并用 `state.json` 控制重复推送。
+每天北京时间 08:30 检查 BitMEX `.BVOL7D` 指数、CFTC/CME Bitcoin futures open interest，以及 USDT 总发行/流通量。满足任意预警条件时，通过 Telegram Bot 推送消息，并用 `state.json` 控制重复推送。
 
 ## 功能
 
 - 数据源优先使用 BitMEX 公共 API，无需交易所 API key。
 - 优先读取 `trade/bucketed` 的 1 日数据；如果无可用数据，自动 fallback 到 `instrument` 的 `lastPrice`、`markPrice`、`indicativeSettlePrice`。
 - 使用 CFTC 官方年度 COT 历史压缩 CSV 监控 CME Bitcoin futures open interest。
+- 使用 DefiLlama stablecoins API 监控 USDT 总发行/流通量。
 - 支持 Telegram Markdown 消息。
 - 所有异常写入日志，日志同时显示 UTC 与北京时间。
 - 不交易、不下单。
@@ -90,6 +91,7 @@ Dry-run 测试，不发送 Telegram，不更新 `state.json`：
 ```bash
 ./.venv/bin/python main.py --monitor bvol --dry-run
 ./.venv/bin/python main.py --monitor cftc-oi --dry-run
+./.venv/bin/python main.py --monitor usdt-supply --dry-run
 ```
 
 忽略当天已推送状态，适合手动验证：
@@ -196,6 +198,36 @@ ENABLE_CFTC_BTC_OI_MEAN_ALERT=false
 CFTC_BTC_OI_USD_THRESHOLD=10000000000
 ```
 
+## USDT 发行总量监控
+
+机器人默认启用 USDT 总发行/流通量监控。数据来自 DefiLlama stablecoins API，筛选 Tether/USDT：
+
+```text
+stablecoin id: 1
+symbol: USDT
+```
+
+默认规则：
+
+- 读取 USDT 当前总量和前一日总量。
+- 计算 24h 总量变化百分比。
+- 当总量跌幅 `>= 0.5%` 时触发。
+- 同一个北京时间日期只推送一次。
+
+可以在 `.env` 修改：
+
+```bash
+ENABLE_USDT_SUPPLY=true
+USDT_SUPPLY_STABLECOIN_ID=1
+USDT_SUPPLY_DROP_THRESHOLD_PERCENT=0.5
+```
+
+如果你想临时测试 USDT 推送，可以把阈值调得很小：
+
+```bash
+USDT_SUPPLY_DROP_THRESHOLD_PERCENT=0.001 ./.venv/bin/python main.py --monitor usdt-supply --dry-run
+```
+
 ## 如何设置 cron
 
 确认服务器时区：
@@ -293,6 +325,12 @@ LOW_VOL_LOW_THRESHOLD=100 HIGH_VOL_WARNING_THRESHOLD=101 HIGH_VOL_ALERT_THRESHOL
 CFTC_BTC_OI_MEAN_MULTIPLIER=0.1 ./.venv/bin/python main.py --monitor cftc-oi --ignore-state
 ```
 
+如果只想测试 USDT 总量推送，可以临时降低跌幅阈值：
+
+```bash
+USDT_SUPPLY_DROP_THRESHOLD_PERCENT=0.001 ./.venv/bin/python main.py --monitor usdt-supply --ignore-state
+```
+
 测试完成后正常运行：
 
 ```bash
@@ -361,4 +399,25 @@ BTCUSD：$75,591（.BXBT.lastPrice）
 
 风险提示：
 OI 升高本身不判断方向，但常意味着后续波动、挤仓或趋势延续风险上升，请结合价格、资金费率和波动率一起看。
+```
+
+### USDT Supply
+
+消息示例：
+
+```text
+🔴 USDT 发行总量下跌预警
+
+指标：USDT 总发行/流通量
+数据源：DefiLlama Stablecoins
+当前总量：186.832B USDT
+昨日总量：186.837B USDT
+24h变化：-5.079M USDT（-0.003%）
+跌幅阈值：-0.500%
+
+触发原因：
+- USDT 总量 24h 跌幅 >= 0.500%
+
+风险提示：
+稳定币供应下滑本身不判断价格方向，但会影响市场可用美元流动性，请结合 BTC 波动率、CME OI、交易所余额和价格结构一起看。
 ```

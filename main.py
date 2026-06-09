@@ -19,6 +19,7 @@ from utils.bitmex import (
 from utils.cftc import CFTCDataError, COTOpenInterestPoint, get_btc_cme_open_interest_history
 from utils.indicators import evaluate_alerts
 from utils.logger import setup_logger
+from utils.stablecoins import StablecoinsDataError, USDTSupplySnapshot, get_usdt_supply_snapshot
 from utils.telegram import TelegramError, send_telegram_message
 
 
@@ -26,6 +27,7 @@ SYMBOL = ".BVOL7D"
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 MONITOR_BVOL = "bitmex_bvol"
 MONITOR_CFTC_BTC_OI = "cftc_btc_oi"
+MONITOR_USDT_SUPPLY = "usdt_supply"
 DEFAULT_HIGH_VOL_WARNING_THRESHOLD = 13.0
 DEFAULT_HIGH_VOL_ALERT_THRESHOLD = 15.0
 DEFAULT_LOW_VOL_LOW_THRESHOLD = 4.0
@@ -34,13 +36,14 @@ DEFAULT_LOW_VOL_HIGH_THRESHOLD = 2.0
 DEFAULT_CFTC_BTC_OI_LOOKBACK_WEEKS = 52
 DEFAULT_CFTC_BTC_OI_MIN_HISTORY_WEEKS = 8
 DEFAULT_CFTC_BTC_OI_MEAN_MULTIPLIER = 1.0
+DEFAULT_USDT_SUPPLY_DROP_THRESHOLD_PERCENT = 0.5
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BTC volatility and CME open interest alert bot")
     parser.add_argument(
         "--monitor",
-        choices=("all", "bvol", "cftc-oi"),
+        choices=("all", "bvol", "cftc-oi", "usdt-supply"),
         default="all",
         help="Select which monitor to run. Default: all.",
     )
@@ -150,6 +153,18 @@ def format_usd(value: int | float | None) -> str:
     if abs_value >= 1_000_000:
         return f"{sign}${abs_value / 1_000_000:,.2f}M"
     return f"{sign}${abs_value:,.0f}"
+
+
+def format_supply(value: int | float | None, symbol: str = "") -> str:
+    if value is None:
+        return "N/A"
+    number = float(value)
+    suffix = f" {symbol}" if symbol else ""
+    if abs(number) >= 1_000_000_000:
+        return f"{number / 1_000_000_000:,.3f}B{suffix}"
+    if abs(number) >= 1_000_000:
+        return f"{number / 1_000_000:,.3f}M{suffix}"
+    return f"{number:,.0f}{suffix}"
 
 
 def get_last_alert_key(state: dict, monitor: str) -> str | None:
@@ -664,6 +679,123 @@ def run_cftc_btc_oi_monitor(
     )
 
 
+def build_usdt_supply_message(
+    *,
+    snapshot: USDTSupplySnapshot,
+    drop_threshold_percent: float,
+    utc_now: datetime,
+    beijing_now: datetime,
+) -> str:
+    daily_change = snapshot.daily_change
+    daily_change_percent = snapshot.daily_change_percent
+
+    return (
+        "🔴 *USDT 发行总量下跌预警*\n\n"
+        "指标：USDT 总发行/流通量\n"
+        "数据源：DefiLlama Stablecoins\n"
+        f"当前总量：{format_supply(snapshot.current_supply, snapshot.symbol)}\n"
+        f"昨日总量：{format_supply(snapshot.previous_day_supply, snapshot.symbol)}\n"
+        f"24h变化：{format_supply(daily_change, snapshot.symbol)}（{daily_change_percent:+.3f}%）\n"
+        f"跌幅阈值：-{drop_threshold_percent:.3f}%\n"
+        f"7日前总量：{format_supply(snapshot.previous_week_supply, snapshot.symbol)}\n"
+        f"30日前总量：{format_supply(snapshot.previous_month_supply, snapshot.symbol)}\n\n"
+        "检查时间：\n"
+        f"UTC：{format_dt(utc_now)}\n"
+        f"北京时间：{format_dt(beijing_now)}\n\n"
+        "触发原因：\n"
+        f"- USDT 总量 24h 跌幅 >= {drop_threshold_percent:.3f}%\n\n"
+        "状态判断：\n"
+        "USDT 发行/流通总量出现明显收缩，可能代表稳定币流动性下降或链上资金撤出。\n\n"
+        "风险提示：\n"
+        "稳定币供应下滑本身不判断价格方向，但会影响市场可用美元流动性，请结合 BTC 波动率、CME OI、交易所余额和价格结构一起看。"
+    )
+
+
+def run_usdt_supply_monitor(
+    *,
+    args: argparse.Namespace,
+    state: dict,
+    state_file: Path,
+    logger: logging.Logger,
+    utc_now: datetime,
+    beijing_now: datetime,
+) -> int:
+    if not parse_bool_env("ENABLE_USDT_SUPPLY", True):
+        logger.info("USDT supply monitor disabled by ENABLE_USDT_SUPPLY.")
+        return 0
+
+    try:
+        drop_threshold_percent = parse_float_env(
+            "USDT_SUPPLY_DROP_THRESHOLD_PERCENT",
+            DEFAULT_USDT_SUPPLY_DROP_THRESHOLD_PERCENT,
+        )
+    except ValueError:
+        logger.exception("Invalid USDT supply threshold configuration.")
+        return 2
+
+    if drop_threshold_percent <= 0:
+        logger.error("Invalid USDT_SUPPLY_DROP_THRESHOLD_PERCENT. Expected positive value.")
+        return 2
+
+    stablecoin_id = os.getenv("USDT_SUPPLY_STABLECOIN_ID", "1").strip() or "1"
+    try:
+        snapshot = get_usdt_supply_snapshot(stablecoin_id=stablecoin_id)
+    except StablecoinsDataError:
+        logger.exception("Failed to fetch USDT supply data.")
+        return 1
+
+    logger.info(
+        (
+            "USDT supply result | current=%.2f | previous_day=%.2f | "
+            "daily_change=%.2f | daily_change_percent=%.4f | threshold=%.4f"
+        ),
+        snapshot.current_supply,
+        snapshot.previous_day_supply,
+        snapshot.daily_change,
+        snapshot.daily_change_percent,
+        drop_threshold_percent,
+    )
+
+    if snapshot.daily_change_percent > -drop_threshold_percent:
+        logger.info("No USDT supply alert conditions met.")
+        return 0
+
+    today_beijing = beijing_now.date().isoformat()
+    last_alert_key = get_last_alert_key(state, MONITOR_USDT_SUPPLY)
+    if last_alert_key == today_beijing and not args.ignore_state:
+        logger.info("USDT supply alert already sent today Beijing date=%s. Skipping.", today_beijing)
+        return 0
+
+    message = build_usdt_supply_message(
+        snapshot=snapshot,
+        drop_threshold_percent=drop_threshold_percent,
+        utc_now=utc_now,
+        beijing_now=beijing_now,
+    )
+
+    return send_alert(
+        message=message,
+        args=args,
+        state=state,
+        state_file=state_file,
+        logger=logger,
+        monitor=MONITOR_USDT_SUPPLY,
+        alert_key=today_beijing,
+        utc_now=utc_now,
+        beijing_now=beijing_now,
+        metadata={
+            "stablecoin_id": snapshot.stablecoin_id,
+            "symbol": snapshot.symbol,
+            "current_supply": snapshot.current_supply,
+            "previous_day_supply": snapshot.previous_day_supply,
+            "daily_change": snapshot.daily_change,
+            "daily_change_percent": snapshot.daily_change_percent,
+            "drop_threshold_percent": drop_threshold_percent,
+            "source_url": snapshot.source_url,
+        },
+    )
+
+
 def main() -> int:
     args = parse_args()
     load_dotenv()
@@ -699,6 +831,18 @@ def main() -> int:
     if args.monitor in {"all", "cftc-oi"}:
         exit_codes.append(
             run_cftc_btc_oi_monitor(
+                args=args,
+                state=state,
+                state_file=state_file,
+                logger=logger,
+                utc_now=utc_now,
+                beijing_now=beijing_now,
+            )
+        )
+
+    if args.monitor in {"all", "usdt-supply"}:
+        exit_codes.append(
+            run_usdt_supply_monitor(
                 args=args,
                 state=state,
                 state_file=state_file,
