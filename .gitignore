@@ -10,3 +10,4 @@ state.json
 *.db
 .pytest_cache/
 .streamlit/
+*.htpasswd
