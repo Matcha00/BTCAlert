@@ -1,2 +1,4 @@
 requests>=2.32.0,<3
 python-dotenv>=1.0.1,<2
+streamlit>=1.36.0,<2
+pytest>=8.2.0,<9

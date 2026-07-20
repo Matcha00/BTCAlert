@@ -7,11 +7,11 @@ import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
 
-import requests
+from utils.http import HTTPRequestError, request_bytes
 
 
 CFTC_HISTORY_URL_TEMPLATE = "https://www.cftc.gov/files/dea/history/deacot{year}.zip"
-TIMEOUT_SECONDS = 10
+TIMEOUT = (5.0, 10.0)
 BTC_CME_MARKET_NAME = "BITCOIN - CHICAGO MERCANTILE EXCHANGE"
 BTC_CME_CONTRACT_CODE = "133741"
 
@@ -63,10 +63,9 @@ def _parse_contract_size_btc(contract_units: str | None) -> float | None:
 def _fetch_year_rows(year: int) -> list[dict[str, str]]:
     url = CFTC_HISTORY_URL_TEMPLATE.format(year=year)
     try:
-        response = requests.get(url, timeout=TIMEOUT_SECONDS)
-        response.raise_for_status()
-        archive = zipfile.ZipFile(io.BytesIO(response.content))
-    except (requests.RequestException, zipfile.BadZipFile) as exc:
+        content = request_bytes("GET", url, timeout=TIMEOUT)
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except (HTTPRequestError, zipfile.BadZipFile) as exc:
         raise CFTCDataError(f"Failed to fetch or open CFTC history zip: {url}") from exc
 
     try:

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run BTC volatility alert every day at 08:30 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 08:30:00
+Persistent=true
+RandomizedDelaySec=30s
+AccuracySec=1min
+Unit=btc-vol-alert.service
+
+[Install]
+WantedBy=timers.target

@@ -23,9 +23,7 @@ class DualTimezoneFormatter(logging.Formatter):
         return f"UTC={utc_text} Beijing={beijing_text}"
 
 
-def setup_logger(log_file: Path) -> logging.Logger:
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
+def setup_logger(log_file: Path | None) -> logging.Logger:
     logger = logging.getLogger("btc_vol_alert")
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -37,17 +35,19 @@ def setup_logger(log_file: Path) -> logging.Logger:
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
 
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
 
-    logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
     return logger

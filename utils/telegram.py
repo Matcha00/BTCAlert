@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 
-import requests
+from utils.http import HTTPRequestError, request_json, sanitize_url
 
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
-TIMEOUT_SECONDS = 10
+TIMEOUT = (5.0, 10.0)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -29,20 +29,13 @@ def send_telegram_message(
     }
 
     try:
-        response = requests.post(url, data=payload, timeout=TIMEOUT_SECONDS)
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
-        status = getattr(exc.response, "status_code", "N/A")
-        body = getattr(exc.response, "text", "")
-        LOGGER.error("Telegram request failed | status=%s | body=%s", status, body)
+        data = request_json("POST", url, data=payload, timeout=TIMEOUT, logger=LOGGER)
+    except HTTPRequestError as exc:
+        LOGGER.error("Telegram request failed | url=%s", sanitize_url(url))
         raise TelegramError("Telegram request failed.") from exc
-    except ValueError as exc:
-        LOGGER.error("Telegram response is not valid JSON | body=%s", response.text)
-        raise TelegramError("Telegram response is not valid JSON.") from exc
 
     if not data.get("ok"):
-        LOGGER.error("Telegram API returned ok=false | response=%s", data)
+        LOGGER.error("Telegram API returned ok=false | description=%s", data.get("description"))
         raise TelegramError("Telegram API returned ok=false.")
 
     return data

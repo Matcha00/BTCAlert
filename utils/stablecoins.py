@@ -3,11 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import requests
+from utils.http import HTTPRequestError, request_json
 
 
 DEFILLAMA_STABLECOINS_URL = "https://stablecoins.llama.fi/stablecoins"
-TIMEOUT_SECONDS = 10
+TIMEOUT = (5.0, 10.0)
 DEFAULT_USDT_STABLECOIN_ID = "1"
 
 
@@ -53,13 +53,9 @@ def _pegged_usd(container: dict[str, Any] | None) -> float | None:
 def get_usdt_supply_snapshot(stablecoin_id: str = DEFAULT_USDT_STABLECOIN_ID) -> USDTSupplySnapshot:
     params = {"includePrices": "true"}
     try:
-        response = requests.get(DEFILLAMA_STABLECOINS_URL, params=params, timeout=TIMEOUT_SECONDS)
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
+        data = request_json("GET", DEFILLAMA_STABLECOINS_URL, params=params, timeout=TIMEOUT)
+    except HTTPRequestError as exc:
         raise StablecoinsDataError("Failed to fetch DefiLlama stablecoins data.") from exc
-    except ValueError as exc:
-        raise StablecoinsDataError("DefiLlama stablecoins response is not valid JSON.") from exc
 
     assets = data.get("peggedAssets") if isinstance(data, dict) else None
     if not isinstance(assets, list):

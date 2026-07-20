@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-import requests
+from utils.http import HTTPRequestError, request_json
 
 
 BASE_URL = "https://www.bitmex.com/api/v1"
-TIMEOUT_SECONDS = 10
+TIMEOUT = (5.0, 10.0)
 PRICE_FALLBACK_FIELDS = ("lastPrice", "markPrice", "indicativeSettlePrice")
 BTC_PRICE_FIELDS = ("lastPrice", "markPrice", "indicativeSettlePrice", "fairPrice")
 
@@ -18,13 +18,9 @@ class BitmexAPIError(RuntimeError):
 def _get_json(path: str, params: dict[str, Any]) -> Any:
     url = f"{BASE_URL}{path}"
     try:
-        response = requests.get(url, params=params, timeout=TIMEOUT_SECONDS)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
+        return request_json("GET", url, params=params, timeout=TIMEOUT)
+    except HTTPRequestError as exc:
         raise BitmexAPIError(f"BitMEX request failed: {url}") from exc
-    except ValueError as exc:
-        raise BitmexAPIError(f"BitMEX response is not valid JSON: {url}") from exc
 
 
 def get_instrument(symbol: str = ".BVOL7D") -> dict[str, Any]:
@@ -65,6 +61,19 @@ def _as_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number
+
+
+def extract_bucket_timestamp(row: dict[str, Any]) -> str | None:
+    value = row.get("timestamp")
+    return str(value) if value else None
+
+
+def extract_instrument_timestamp(instrument: dict[str, Any]) -> str | None:
+    for field in ("timestamp", "markTimestamp", "indicativeSettleTimestamp"):
+        value = instrument.get(field)
+        if value:
+            return str(value)
+    return None
 
 
 def _bucket_close(row: dict[str, Any]) -> float | None:

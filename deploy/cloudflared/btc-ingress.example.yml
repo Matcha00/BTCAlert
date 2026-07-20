@@ -1,0 +1,3 @@
+# Add this ingress rule to the existing stock-scanner tunnel before the final catch-all rule.
+- hostname: btc.matcha00.xyz
+  service: http://127.0.0.1:8502

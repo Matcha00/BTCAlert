@@ -1,25 +1,43 @@
+from __future__ import annotations
+
 import argparse
-import json
 import logging
+import math
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
 from utils.bitmex import (
     BitmexAPIError,
-    get_bucketed_trades,
+    extract_bucket_timestamp,
+    extract_instrument_timestamp,
     get_btc_usd_price,
+    get_bucketed_trades,
     get_current_bvol_value,
-    get_instrument,
     get_historical_closes,
+    get_instrument,
 )
 from utils.cftc import CFTCDataError, COTOpenInterestPoint, get_btc_cme_open_interest_history
+from utils.freshness import FreshnessError, ensure_date_fresh, ensure_datetime_fresh, parse_iso_datetime
 from utils.indicators import evaluate_alerts
 from utils.logger import setup_logger
 from utils.stablecoins import StablecoinsDataError, USDTSupplySnapshot, get_usdt_supply_snapshot
+from utils.state import (
+    get_last_alert_key,
+    load_state,
+    mark_failure_alert_sent,
+    mark_recovery_alert_sent,
+    record_alert_sent,
+    record_monitor_error,
+    record_monitor_run,
+    record_monitor_success,
+    write_state_atomic,
+)
 from utils.telegram import TelegramError, send_telegram_message
 
 
@@ -28,19 +46,43 @@ BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 MONITOR_BVOL = "bitmex_bvol"
 MONITOR_CFTC_BTC_OI = "cftc_btc_oi"
 MONITOR_USDT_SUPPLY = "usdt_supply"
+MONITOR_NAMES = {
+    MONITOR_BVOL: "BitMEX .BVOL7D",
+    MONITOR_CFTC_BTC_OI: "CFTC/CME BTC 持仓",
+    MONITOR_USDT_SUPPLY: "USDT 发行总量",
+}
+
 DEFAULT_HIGH_VOL_WARNING_THRESHOLD = 13.0
 DEFAULT_HIGH_VOL_ALERT_THRESHOLD = 15.0
 DEFAULT_LOW_VOL_LOW_THRESHOLD = 4.0
 DEFAULT_LOW_VOL_MEDIUM_THRESHOLD = 3.0
 DEFAULT_LOW_VOL_HIGH_THRESHOLD = 2.0
+DEFAULT_BVOL_MAX_DATA_AGE_HOURS = 72.0
 DEFAULT_CFTC_BTC_OI_LOOKBACK_WEEKS = 52
 DEFAULT_CFTC_BTC_OI_MIN_HISTORY_WEEKS = 8
 DEFAULT_CFTC_BTC_OI_MEAN_MULTIPLIER = 1.0
+DEFAULT_CFTC_MAX_REPORT_AGE_DAYS = 21
 DEFAULT_USDT_SUPPLY_DROP_THRESHOLD_PERCENT = 0.5
+DEFAULT_FAILURE_ALERT_THRESHOLD = 3
+
+
+class ConfigError(RuntimeError):
+    """Raised when environment configuration is invalid."""
+
+
+@dataclass
+class MonitorCheck:
+    monitor: str
+    current_value: float | int | None
+    data_date: str | None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    alert_key: str | None = None
+    alert_message: str | None = None
+    alert_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="BTC volatility and CME open interest alert bot")
+    parser = argparse.ArgumentParser(description="BTC volatility and market risk alert bot")
     parser.add_argument(
         "--monitor",
         choices=("all", "bvol", "cftc-oi", "usdt-supply"),
@@ -50,14 +92,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run all checks without sending Telegram messages or updating state.json.",
+        help="Run checks without sending Telegram messages or updating state.",
     )
     parser.add_argument(
         "--ignore-state",
         action="store_true",
-        help="Ignore same-day alert suppression. Useful for manual testing.",
+        help="Ignore duplicate alert suppression. Useful for manual testing.",
     )
     return parser.parse_args()
+
+
+def load_environment() -> None:
+    env_file = os.getenv("BTC_VOL_ENV_FILE")
+    if env_file:
+        load_dotenv(env_file)
+    else:
+        load_dotenv()
 
 
 def get_dual_now() -> tuple[datetime, datetime]:
@@ -74,21 +124,30 @@ def parse_float_env(name: str, default: float) -> float:
     raw_value = os.getenv(name)
     if raw_value is None or raw_value.strip() == "":
         return default
-    return float(raw_value)
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid float env {name}") from exc
 
 
 def parse_optional_float_env(name: str) -> float | None:
     raw_value = os.getenv(name)
     if raw_value is None or raw_value.strip() == "":
         return None
-    return float(raw_value)
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid float env {name}") from exc
 
 
 def parse_int_env(name: str, default: int) -> int:
     raw_value = os.getenv(name)
     if raw_value is None or raw_value.strip() == "":
         return default
-    return int(raw_value)
+    try:
+        return int(raw_value)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid integer env {name}") from exc
 
 
 def parse_bool_env(name: str, default: bool = True) -> bool:
@@ -98,48 +157,40 @@ def parse_bool_env(name: str, default: bool = True) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def read_state(path: Path, logger: logging.Logger) -> dict:
-    if not path.exists():
-        return {"last_alert_date": None}
-
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            state = json.load(file)
-    except (OSError, json.JSONDecodeError):
-        logger.exception("Failed to read state file: %s", path)
-        return {"last_alert_date": None}
-
-    if not isinstance(state, dict):
-        logger.error("Invalid state file format: %s", path)
-        return {"last_alert_date": None}
-
-    return state
-
-
-def write_state(path: Path, state: dict, logger: logging.Logger) -> None:
-    try:
-        path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    except OSError:
-        logger.exception("Failed to write state file: %s", path)
-        raise
+def validate_finite_number(
+    name: str,
+    value: float | int | None,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> None:
+    if value is None:
+        raise ValueError(f"{name} is missing.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} is not finite.")
+    if min_value is not None and number < min_value:
+        raise ValueError(f"{name} is below minimum {min_value}.")
+    if max_value is not None and number > max_value:
+        raise ValueError(f"{name} is above maximum {max_value}.")
 
 
-def format_number(value: float | None, digits: int = 1) -> str:
+def format_number(value: float | int | None, digits: int = 1) -> str:
     if value is None:
         return "N/A"
-    return f"{value:.{digits}f}"
+    return f"{float(value):.{digits}f}"
 
 
-def format_signed_number(value: float | None, digits: int = 1) -> str:
+def format_signed_number(value: float | int | None, digits: int = 1) -> str:
     if value is None:
         return "N/A"
-    return f"{value:+.{digits}f}"
+    return f"{float(value):+.{digits}f}"
 
 
 def format_int(value: int | float | None) -> str:
     if value is None:
         return "N/A"
-    return f"{value:,.0f}"
+    return f"{float(value):,.0f}"
 
 
 def format_usd(value: int | float | None) -> str:
@@ -167,44 +218,8 @@ def format_supply(value: int | float | None, symbol: str = "") -> str:
     return f"{number:,.0f}{suffix}"
 
 
-def get_last_alert_key(state: dict, monitor: str) -> str | None:
-    alert_keys = state.get("last_alert_keys", {})
-    if isinstance(alert_keys, dict) and monitor in alert_keys:
-        return alert_keys.get(monitor)
-    if monitor == MONITOR_BVOL:
-        return state.get("last_alert_date")
-    return None
-
-
-def update_monitor_state(
-    state: dict,
-    monitor: str,
-    alert_key: str,
-    utc_now: datetime,
-    beijing_now: datetime,
-    metadata: dict,
-) -> None:
-    alert_keys = state.setdefault("last_alert_keys", {})
-    if isinstance(alert_keys, dict):
-        alert_keys[monitor] = alert_key
-
-    monitors = state.setdefault("monitors", {})
-    if isinstance(monitors, dict):
-        monitors[monitor] = {
-            "last_alert_key": alert_key,
-            "last_alert_utc": format_dt(utc_now),
-            "last_alert_beijing": format_dt(beijing_now),
-            **metadata,
-        }
-
-    if monitor == MONITOR_BVOL:
-        state["last_alert_date"] = alert_key
-        state["last_alert_utc"] = format_dt(utc_now)
-        state["last_alert_beijing"] = format_dt(beijing_now)
-        state["last_alert_value"] = metadata.get("value")
-        state["last_alert_regime"] = metadata.get("regime")
-        state["last_alert_level"] = metadata.get("level")
-        state["last_alert_reasons"] = metadata.get("reasons")
+def calculate_mean(values: list[int | float]) -> float:
+    return sum(values) / len(values)
 
 
 def get_telegram_config(logger: logging.Logger) -> tuple[str, str] | None:
@@ -216,46 +231,23 @@ def get_telegram_config(logger: logging.Logger) -> tuple[str, str] | None:
     return token, chat_id
 
 
-def send_alert(
-    *,
-    message: str,
-    args: argparse.Namespace,
-    state: dict,
-    state_file: Path,
-    logger: logging.Logger,
-    monitor: str,
-    alert_key: str,
-    utc_now: datetime,
-    beijing_now: datetime,
-    metadata: dict,
-) -> int:
+def send_telegram_safely(message: str, args: argparse.Namespace, logger: logging.Logger) -> bool:
     if args.dry_run:
-        logger.info("Dry-run mode. Telegram message not sent and state not updated.")
+        logger.info("Dry-run mode. Telegram message not sent.")
         logger.info("Dry-run Telegram message:\n%s", message)
-        return 0
+        return True
 
     telegram_config = get_telegram_config(logger)
     if telegram_config is None:
-        return 3
+        return False
     token, chat_id = telegram_config
 
     try:
         send_telegram_message(token=token, chat_id=chat_id, text=message)
     except TelegramError:
         logger.exception("Telegram message failed.")
-        return 4
-
-    update_monitor_state(
-        state=state,
-        monitor=monitor,
-        alert_key=alert_key,
-        utc_now=utc_now,
-        beijing_now=beijing_now,
-        metadata=metadata,
-    )
-    write_state(state_file, state, logger)
-    logger.info("Alert sent successfully and state updated | monitor=%s", monitor)
-    return 0
+        return False
+    return True
 
 
 def build_telegram_message(
@@ -297,47 +289,40 @@ def build_telegram_message(
     )
 
 
-def run_bvol_monitor(
+def check_bvol(
     *,
     args: argparse.Namespace,
-    state: dict,
-    state_file: Path,
     logger: logging.Logger,
     utc_now: datetime,
     beijing_now: datetime,
-) -> int:
-    try:
-        high_vol_warning_threshold = parse_float_env(
-            "HIGH_VOL_WARNING_THRESHOLD", DEFAULT_HIGH_VOL_WARNING_THRESHOLD
-        )
-        high_vol_alert_threshold = parse_float_env(
-            "HIGH_VOL_ALERT_THRESHOLD", DEFAULT_HIGH_VOL_ALERT_THRESHOLD
-        )
-        low_vol_low_threshold = parse_float_env(
-            "LOW_VOL_LOW_THRESHOLD", DEFAULT_LOW_VOL_LOW_THRESHOLD
-        )
-        low_vol_medium_threshold = parse_float_env(
-            "LOW_VOL_MEDIUM_THRESHOLD", DEFAULT_LOW_VOL_MEDIUM_THRESHOLD
-        )
-        low_vol_high_threshold = parse_float_env(
-            "LOW_VOL_HIGH_THRESHOLD", DEFAULT_LOW_VOL_HIGH_THRESHOLD
-        )
-    except ValueError:
-        logger.exception("Invalid BitMEX .BVOL7D threshold configuration.")
-        return 2
+) -> MonitorCheck:
+    high_vol_warning_threshold = parse_float_env(
+        "HIGH_VOL_WARNING_THRESHOLD", DEFAULT_HIGH_VOL_WARNING_THRESHOLD
+    )
+    high_vol_alert_threshold = parse_float_env(
+        "HIGH_VOL_ALERT_THRESHOLD", DEFAULT_HIGH_VOL_ALERT_THRESHOLD
+    )
+    low_vol_low_threshold = parse_float_env("LOW_VOL_LOW_THRESHOLD", DEFAULT_LOW_VOL_LOW_THRESHOLD)
+    low_vol_medium_threshold = parse_float_env(
+        "LOW_VOL_MEDIUM_THRESHOLD", DEFAULT_LOW_VOL_MEDIUM_THRESHOLD
+    )
+    low_vol_high_threshold = parse_float_env(
+        "LOW_VOL_HIGH_THRESHOLD", DEFAULT_LOW_VOL_HIGH_THRESHOLD
+    )
+    max_data_age_hours = parse_float_env("BVOL_MAX_DATA_AGE_HOURS", DEFAULT_BVOL_MAX_DATA_AGE_HOURS)
 
     if not (
-        low_vol_high_threshold < low_vol_medium_threshold < low_vol_low_threshold
-        < high_vol_warning_threshold <= high_vol_alert_threshold
+        low_vol_high_threshold
+        < low_vol_medium_threshold
+        < low_vol_low_threshold
+        < high_vol_warning_threshold
+        <= high_vol_alert_threshold
     ):
-        logger.error(
-            (
-                "Invalid threshold order. Expected LOW_VOL_HIGH_THRESHOLD < "
-                "LOW_VOL_MEDIUM_THRESHOLD < LOW_VOL_LOW_THRESHOLD < "
-                "HIGH_VOL_WARNING_THRESHOLD <= HIGH_VOL_ALERT_THRESHOLD."
-            )
+        raise ConfigError(
+            "Invalid threshold order. Expected LOW_VOL_HIGH_THRESHOLD < "
+            "LOW_VOL_MEDIUM_THRESHOLD < LOW_VOL_LOW_THRESHOLD < "
+            "HIGH_VOL_WARNING_THRESHOLD <= HIGH_VOL_ALERT_THRESHOLD."
         )
-        return 2
 
     try:
         bucketed_trades = get_bucketed_trades(symbol=SYMBOL)
@@ -351,11 +336,33 @@ def run_bvol_monitor(
         logger.exception("Failed to fetch BitMEX instrument data.")
         instrument = {}
 
-    try:
-        current_value, source = get_current_bvol_value(bucketed_trades, instrument)
-    except BitmexAPIError:
-        logger.exception("Unable to determine current %s value.", SYMBOL)
-        return 1
+    current_value, source = get_current_bvol_value(bucketed_trades, instrument)
+    validate_finite_number(".BVOL7D current value", current_value, min_value=0, max_value=500)
+
+    bucket_time = (
+        parse_iso_datetime(extract_bucket_timestamp(bucketed_trades[0]))
+        if bucketed_trades
+        else None
+    )
+    instrument_time = parse_iso_datetime(extract_instrument_timestamp(instrument))
+    if source.startswith("trade/bucketed"):
+        ensure_datetime_fresh(
+            source="BitMEX trade/bucketed",
+            data_time=bucket_time,
+            now_utc=utc_now,
+            max_age_hours=max_data_age_hours,
+            required=True,
+        )
+        data_time = bucket_time
+    else:
+        ensure_datetime_fresh(
+            source="BitMEX instrument",
+            data_time=instrument_time,
+            now_utc=utc_now,
+            max_age_hours=max_data_age_hours,
+            required=False,
+        )
+        data_time = instrument_time or bucket_time
 
     historical_values = get_historical_closes(bucketed_trades)
     if source.startswith("trade/bucketed"):
@@ -374,10 +381,25 @@ def run_bvol_monitor(
         low_vol_high_threshold=low_vol_high_threshold,
     )
 
+    data_date = (
+        data_time.astimezone(BEIJING_TZ).date().isoformat()
+        if data_time is not None
+        else beijing_now.date().isoformat()
+    )
+    metadata = {
+        "source": source,
+        "previous_value": previous_value,
+        "daily_change": result.daily_change,
+        "percentile_rank": result.percentile_rank,
+        "history_count": len(historical_values),
+        "bucket_timestamp_utc": format_dt(bucket_time) if bucket_time else None,
+        "instrument_timestamp_utc": format_dt(instrument_time) if instrument_time else None,
+    }
+
     logger.info(
         (
             "Check result | symbol=%s | current=%.4f | source=%s | previous=%s | "
-            "daily_change=%s | percentile_rank=%s | reasons=%s"
+            "daily_change=%s | percentile_rank=%s | data_date=%s | reasons=%s"
         ),
         SYMBOL,
         current_value,
@@ -385,21 +407,24 @@ def run_bvol_monitor(
         format_number(previous_value, 4),
         format_signed_number(result.daily_change, 4),
         "N/A" if result.percentile_rank is None else f"{result.percentile_rank:.2f}",
+        data_date,
         result.reasons,
+    )
+
+    check = MonitorCheck(
+        monitor=MONITOR_BVOL,
+        current_value=current_value,
+        data_date=data_date,
+        metadata=metadata,
     )
 
     if not result.should_alert:
         logger.info("No BitMEX .BVOL7D alert conditions met.")
-        return 0
+        return check
 
     today_beijing = beijing_now.date().isoformat()
-    last_alert_date = get_last_alert_key(state, MONITOR_BVOL)
-
-    if last_alert_date == today_beijing and not args.ignore_state:
-        logger.info("Alert already sent today Beijing date=%s. Skipping.", today_beijing)
-        return 0
-
-    message = build_telegram_message(
+    check.alert_key = today_beijing
+    check.alert_message = build_telegram_message(
         current_value=current_value,
         previous_value=previous_value,
         daily_change=result.daily_change,
@@ -412,29 +437,14 @@ def run_bvol_monitor(
         utc_now=utc_now,
         beijing_now=beijing_now,
     )
-
-    return send_alert(
-        message=message,
-        args=args,
-        state=state,
-        state_file=state_file,
-        logger=logger,
-        monitor=MONITOR_BVOL,
-        alert_key=today_beijing,
-        utc_now=utc_now,
-        beijing_now=beijing_now,
-        metadata={
-            "value": current_value,
-            "source": source,
-            "regime": result.regime,
-            "level": result.level,
-            "reasons": result.reasons,
-        },
-    )
-
-
-def calculate_mean(values: list[int]) -> float:
-    return sum(values) / len(values)
+    check.alert_metadata = {
+        "value": current_value,
+        "source": source,
+        "regime": result.regime,
+        "level": result.level,
+        "reasons": result.reasons,
+    }
+    return check
 
 
 def build_cftc_oi_message(
@@ -517,54 +527,50 @@ def build_cftc_oi_message(
     )
 
 
-def run_cftc_btc_oi_monitor(
+def check_cftc_btc_oi(
     *,
     args: argparse.Namespace,
-    state: dict,
-    state_file: Path,
     logger: logging.Logger,
     utc_now: datetime,
     beijing_now: datetime,
-) -> int:
+) -> MonitorCheck:
     if not parse_bool_env("ENABLE_CFTC_BTC_OI", True):
         logger.info("CFTC BTC OI monitor disabled by ENABLE_CFTC_BTC_OI.")
-        return 0
+        return MonitorCheck(monitor=MONITOR_CFTC_BTC_OI, current_value=None, data_date=None)
 
-    try:
-        lookback_weeks = parse_int_env(
-            "CFTC_BTC_OI_LOOKBACK_WEEKS", DEFAULT_CFTC_BTC_OI_LOOKBACK_WEEKS
-        )
-        min_history_weeks = parse_int_env(
-            "CFTC_BTC_OI_MIN_HISTORY_WEEKS", DEFAULT_CFTC_BTC_OI_MIN_HISTORY_WEEKS
-        )
-        enable_mean_alert = parse_bool_env("ENABLE_CFTC_BTC_OI_MEAN_ALERT", True)
-        mean_multiplier = parse_float_env(
-            "CFTC_BTC_OI_MEAN_MULTIPLIER", DEFAULT_CFTC_BTC_OI_MEAN_MULTIPLIER
-        )
-        contract_threshold = parse_optional_float_env("CFTC_BTC_OI_CONTRACT_THRESHOLD")
-        legacy_contract_threshold = parse_optional_float_env("CFTC_BTC_OI_ABSOLUTE_THRESHOLD")
-        btc_threshold = parse_optional_float_env("CFTC_BTC_OI_BTC_THRESHOLD")
-        btc_low_threshold = parse_optional_float_env("CFTC_BTC_OI_BTC_LOW_THRESHOLD")
-        usd_threshold = parse_optional_float_env("CFTC_BTC_OI_USD_THRESHOLD")
-    except ValueError:
-        logger.exception("Invalid CFTC BTC OI threshold configuration.")
-        return 2
+    lookback_weeks = parse_int_env("CFTC_BTC_OI_LOOKBACK_WEEKS", DEFAULT_CFTC_BTC_OI_LOOKBACK_WEEKS)
+    min_history_weeks = parse_int_env(
+        "CFTC_BTC_OI_MIN_HISTORY_WEEKS", DEFAULT_CFTC_BTC_OI_MIN_HISTORY_WEEKS
+    )
+    enable_mean_alert = parse_bool_env("ENABLE_CFTC_BTC_OI_MEAN_ALERT", True)
+    mean_multiplier = parse_float_env(
+        "CFTC_BTC_OI_MEAN_MULTIPLIER", DEFAULT_CFTC_BTC_OI_MEAN_MULTIPLIER
+    )
+    contract_threshold = parse_optional_float_env("CFTC_BTC_OI_CONTRACT_THRESHOLD")
+    legacy_contract_threshold = parse_optional_float_env("CFTC_BTC_OI_ABSOLUTE_THRESHOLD")
+    btc_threshold = parse_optional_float_env("CFTC_BTC_OI_BTC_THRESHOLD")
+    btc_low_threshold = parse_optional_float_env("CFTC_BTC_OI_BTC_LOW_THRESHOLD")
+    usd_threshold = parse_optional_float_env("CFTC_BTC_OI_USD_THRESHOLD")
+    max_report_age_days = parse_int_env("CFTC_MAX_REPORT_AGE_DAYS", DEFAULT_CFTC_MAX_REPORT_AGE_DAYS)
 
     if contract_threshold is None:
         contract_threshold = legacy_contract_threshold
 
     if lookback_weeks < 1 or min_history_weeks < 1 or mean_multiplier <= 0:
-        logger.error("Invalid CFTC BTC OI configuration values.")
-        return 2
+        raise ConfigError("Invalid CFTC BTC OI configuration values.")
 
     years = sorted({utc_now.year, utc_now.year - 1})
-    try:
-        history = get_btc_cme_open_interest_history(years=years)
-    except CFTCDataError:
-        logger.exception("Failed to fetch CFTC BTC open interest data.")
-        return 1
-
+    history = get_btc_cme_open_interest_history(years=years)
     latest = history[-1]
+    ensure_date_fresh(
+        source="CFTC BTC COT",
+        data_date=latest.report_date,
+        now_utc=utc_now,
+        max_age_days=max_report_age_days,
+    )
+    validate_finite_number("CFTC open interest", latest.open_interest, min_value=1, max_value=2_000_000)
+    validate_finite_number("CFTC notional BTC", latest.notional_btc, min_value=1, max_value=10_000_000)
+
     previous_points = history[:-1][-lookback_weeks:]
     if len(previous_points) < min_history_weeks:
         logger.info(
@@ -572,25 +578,25 @@ def run_cftc_btc_oi_monitor(
             len(previous_points),
             min_history_weeks,
         )
-        return 0
+        return MonitorCheck(
+            monitor=MONITOR_CFTC_BTC_OI,
+            current_value=latest.notional_btc,
+            data_date=latest.report_date.isoformat(),
+            metadata={"report_date": latest.report_date.isoformat(), "history_count": len(history)},
+        )
 
     mean_open_interest = calculate_mean([point.open_interest for point in previous_points])
     mean_notional_btc = calculate_mean([point.notional_btc for point in previous_points])
     mean_threshold = mean_open_interest * mean_multiplier
 
-    try:
-        btc_price, btc_price_source = get_btc_usd_price()
-    except BitmexAPIError:
-        logger.exception("Failed to fetch BTCUSD price for CFTC BTC OI notional conversion.")
-        return 1
+    btc_price, btc_price_source = get_btc_usd_price()
+    validate_finite_number("BTCUSD price", btc_price, min_value=100, max_value=5_000_000)
 
     current_notional_btc = latest.notional_btc
     current_notional_usd = current_notional_btc * btc_price
     reasons: list[str] = []
     if enable_mean_alert and latest.open_interest > mean_threshold:
-        reasons.append(
-            f"当前 BTC 名义持仓 > {lookback_weeks}周均值 x {mean_multiplier:.2f}"
-        )
+        reasons.append(f"当前 BTC 名义持仓 > {lookback_weeks}周均值 x {mean_multiplier:.2f}")
     if contract_threshold is not None and latest.open_interest >= contract_threshold:
         reasons.append(f"当前 OI 张数 >= 固定阈值 {format_int(contract_threshold)} 张")
     if btc_threshold is not None and current_notional_btc >= btc_threshold:
@@ -618,17 +624,41 @@ def run_cftc_btc_oi_monitor(
         reasons,
     )
 
+    metadata = {
+        "report_date": latest.report_date.isoformat(),
+        "open_interest": latest.open_interest,
+        "weekly_change": latest.weekly_change,
+        "contract_units": latest.contract_units,
+        "contract_size_btc": latest.contract_size_btc,
+        "notional_btc": current_notional_btc,
+        "notional_usd": current_notional_usd,
+        "btc_price": btc_price,
+        "btc_price_source": btc_price_source,
+        "lookback_weeks": lookback_weeks,
+        "mean_open_interest": mean_open_interest,
+        "mean_notional_btc": mean_notional_btc,
+        "enable_mean_alert": enable_mean_alert,
+        "mean_multiplier": mean_multiplier,
+        "contract_threshold": contract_threshold,
+        "btc_threshold": btc_threshold,
+        "btc_low_threshold": btc_low_threshold,
+        "usd_threshold": usd_threshold,
+        "history_count": len(history),
+    }
+    check = MonitorCheck(
+        monitor=MONITOR_CFTC_BTC_OI,
+        current_value=current_notional_btc,
+        data_date=latest.report_date.isoformat(),
+        metadata=metadata,
+    )
+
     if not reasons:
         logger.info("No CFTC BTC OI alert conditions met.")
-        return 0
+        return check
 
     alert_key = latest.report_date.isoformat()
-    last_alert_key = get_last_alert_key(state, MONITOR_CFTC_BTC_OI)
-    if last_alert_key == alert_key and not args.ignore_state:
-        logger.info("CFTC BTC OI alert already sent for report date=%s. Skipping.", alert_key)
-        return 0
-
-    message = build_cftc_oi_message(
+    check.alert_key = alert_key
+    check.alert_message = build_cftc_oi_message(
         latest=latest,
         lookback_weeks=lookback_weeks,
         mean_open_interest=mean_open_interest,
@@ -644,39 +674,8 @@ def run_cftc_btc_oi_monitor(
         utc_now=utc_now,
         beijing_now=beijing_now,
     )
-
-    return send_alert(
-        message=message,
-        args=args,
-        state=state,
-        state_file=state_file,
-        logger=logger,
-        monitor=MONITOR_CFTC_BTC_OI,
-        alert_key=alert_key,
-        utc_now=utc_now,
-        beijing_now=beijing_now,
-        metadata={
-            "report_date": alert_key,
-            "open_interest": latest.open_interest,
-            "weekly_change": latest.weekly_change,
-            "contract_units": latest.contract_units,
-            "contract_size_btc": latest.contract_size_btc,
-            "notional_btc": current_notional_btc,
-            "notional_usd": current_notional_usd,
-            "btc_price": btc_price,
-            "btc_price_source": btc_price_source,
-            "lookback_weeks": lookback_weeks,
-            "mean_open_interest": mean_open_interest,
-            "mean_notional_btc": mean_notional_btc,
-            "enable_mean_alert": enable_mean_alert,
-            "mean_multiplier": mean_multiplier,
-            "contract_threshold": contract_threshold,
-            "btc_threshold": btc_threshold,
-            "btc_low_threshold": btc_low_threshold,
-            "usd_threshold": usd_threshold,
-            "reasons": reasons,
-        },
-    )
+    check.alert_metadata = {**metadata, "reasons": reasons}
+    return check
 
 
 def build_usdt_supply_message(
@@ -711,38 +710,34 @@ def build_usdt_supply_message(
     )
 
 
-def run_usdt_supply_monitor(
+def check_usdt_supply(
     *,
     args: argparse.Namespace,
-    state: dict,
-    state_file: Path,
     logger: logging.Logger,
     utc_now: datetime,
     beijing_now: datetime,
-) -> int:
+) -> MonitorCheck:
     if not parse_bool_env("ENABLE_USDT_SUPPLY", True):
         logger.info("USDT supply monitor disabled by ENABLE_USDT_SUPPLY.")
-        return 0
+        return MonitorCheck(monitor=MONITOR_USDT_SUPPLY, current_value=None, data_date=None)
 
-    try:
-        drop_threshold_percent = parse_float_env(
-            "USDT_SUPPLY_DROP_THRESHOLD_PERCENT",
-            DEFAULT_USDT_SUPPLY_DROP_THRESHOLD_PERCENT,
-        )
-    except ValueError:
-        logger.exception("Invalid USDT supply threshold configuration.")
-        return 2
-
+    drop_threshold_percent = parse_float_env(
+        "USDT_SUPPLY_DROP_THRESHOLD_PERCENT",
+        DEFAULT_USDT_SUPPLY_DROP_THRESHOLD_PERCENT,
+    )
     if drop_threshold_percent <= 0:
-        logger.error("Invalid USDT_SUPPLY_DROP_THRESHOLD_PERCENT. Expected positive value.")
-        return 2
+        raise ConfigError("Invalid USDT_SUPPLY_DROP_THRESHOLD_PERCENT. Expected positive value.")
 
     stablecoin_id = os.getenv("USDT_SUPPLY_STABLECOIN_ID", "1").strip() or "1"
-    try:
-        snapshot = get_usdt_supply_snapshot(stablecoin_id=stablecoin_id)
-    except StablecoinsDataError:
-        logger.exception("Failed to fetch USDT supply data.")
-        return 1
+    snapshot = get_usdt_supply_snapshot(stablecoin_id=stablecoin_id)
+    validate_finite_number("USDT current supply", snapshot.current_supply, min_value=1_000_000_000)
+    validate_finite_number("USDT previous-day supply", snapshot.previous_day_supply, min_value=1_000_000_000)
+    validate_finite_number(
+        "USDT daily change percent",
+        snapshot.daily_change_percent,
+        min_value=-25,
+        max_value=25,
+    )
 
     logger.info(
         (
@@ -756,53 +751,272 @@ def run_usdt_supply_monitor(
         drop_threshold_percent,
     )
 
+    data_date = beijing_now.date().isoformat()
+    metadata = {
+        "stablecoin_id": snapshot.stablecoin_id,
+        "symbol": snapshot.symbol,
+        "current_supply": snapshot.current_supply,
+        "previous_day_supply": snapshot.previous_day_supply,
+        "previous_week_supply": snapshot.previous_week_supply,
+        "previous_month_supply": snapshot.previous_month_supply,
+        "daily_change": snapshot.daily_change,
+        "daily_change_percent": snapshot.daily_change_percent,
+        "drop_threshold_percent": drop_threshold_percent,
+        "source_url": snapshot.source_url,
+        "fetched_utc": format_dt(utc_now),
+    }
+    check = MonitorCheck(
+        monitor=MONITOR_USDT_SUPPLY,
+        current_value=snapshot.current_supply,
+        data_date=data_date,
+        metadata=metadata,
+    )
+
     if snapshot.daily_change_percent > -drop_threshold_percent:
         logger.info("No USDT supply alert conditions met.")
-        return 0
+        return check
 
-    today_beijing = beijing_now.date().isoformat()
-    last_alert_key = get_last_alert_key(state, MONITOR_USDT_SUPPLY)
-    if last_alert_key == today_beijing and not args.ignore_state:
-        logger.info("USDT supply alert already sent today Beijing date=%s. Skipping.", today_beijing)
-        return 0
-
-    message = build_usdt_supply_message(
+    check.alert_key = data_date
+    check.alert_message = build_usdt_supply_message(
         snapshot=snapshot,
         drop_threshold_percent=drop_threshold_percent,
         utc_now=utc_now,
         beijing_now=beijing_now,
     )
+    check.alert_metadata = metadata
+    return check
 
-    return send_alert(
-        message=message,
-        args=args,
-        state=state,
-        state_file=state_file,
-        logger=logger,
-        monitor=MONITOR_USDT_SUPPLY,
-        alert_key=today_beijing,
-        utc_now=utc_now,
-        beijing_now=beijing_now,
-        metadata={
-            "stablecoin_id": snapshot.stablecoin_id,
-            "symbol": snapshot.symbol,
-            "current_supply": snapshot.current_supply,
-            "previous_day_supply": snapshot.previous_day_supply,
-            "daily_change": snapshot.daily_change,
-            "daily_change_percent": snapshot.daily_change_percent,
-            "drop_threshold_percent": drop_threshold_percent,
-            "source_url": snapshot.source_url,
-        },
+
+def build_failure_message(
+    monitor: str,
+    state: dict[str, Any],
+    utc_now: datetime,
+    beijing_now: datetime,
+) -> str:
+    entry = state.get("monitors", {}).get(monitor, {})
+    error = entry.get("last_error") if isinstance(entry, dict) else None
+    error_text = error.get("message") if isinstance(error, dict) else "未知错误"
+    failures = entry.get("consecutive_failures", 0) if isinstance(entry, dict) else 0
+    name = MONITOR_NAMES.get(monitor, monitor)
+    return (
+        "🔴 *BTCAlert 数据源故障*\n\n"
+        f"监控项：{name}\n"
+        f"连续失败：{failures} 次\n"
+        f"错误：{error_text}\n\n"
+        "检查时间：\n"
+        f"UTC：{format_dt(utc_now)}\n"
+        f"北京时间：{format_dt(beijing_now)}\n\n"
+        "处理建议：\n"
+        "- 检查服务器网络、数据源可用性和 systemd 日志。\n"
+        "- Telegram token 与 chat_id 不会写入日志。"
     )
+
+
+def build_recovery_message(monitor: str, utc_now: datetime, beijing_now: datetime) -> str:
+    name = MONITOR_NAMES.get(monitor, monitor)
+    return (
+        "🟢 *BTCAlert 数据源恢复*\n\n"
+        f"监控项：{name}\n"
+        "状态：本次检查已经成功。\n\n"
+        "恢复时间：\n"
+        f"UTC：{format_dt(utc_now)}\n"
+        f"北京时间：{format_dt(beijing_now)}"
+    )
+
+
+def execute_monitor(
+    *,
+    monitor: str,
+    check_func: Callable[[], MonitorCheck],
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    state_file: Path,
+    logger: logging.Logger,
+    utc_now: datetime,
+    beijing_now: datetime,
+) -> int:
+    try:
+        failure_threshold = parse_int_env("FAILURE_ALERT_THRESHOLD", DEFAULT_FAILURE_ALERT_THRESHOLD)
+        if failure_threshold < 1:
+            raise ConfigError("FAILURE_ALERT_THRESHOLD must be >= 1.")
+    except ConfigError as exc:
+        logger.exception("Invalid failure alert configuration | monitor=%s", monitor)
+        failure_threshold = DEFAULT_FAILURE_ALERT_THRESHOLD
+        return _record_failed_monitor(
+            monitor=monitor,
+            error=exc,
+            exit_code=2,
+            args=args,
+            state=state,
+            state_file=state_file,
+            logger=logger,
+            utc_now=utc_now,
+            beijing_now=beijing_now,
+            failure_threshold=failure_threshold,
+        )
+
+    if not args.dry_run:
+        record_monitor_run(state, monitor, utc_now, beijing_now)
+
+    try:
+        result = check_func()
+    except (ConfigError, ValueError) as exc:
+        logger.exception("Monitor configuration or validation failed | monitor=%s", monitor)
+        return _record_failed_monitor(
+            monitor=monitor,
+            error=exc,
+            exit_code=2,
+            args=args,
+            state=state,
+            state_file=state_file,
+            logger=logger,
+            utc_now=utc_now,
+            beijing_now=beijing_now,
+            failure_threshold=failure_threshold,
+        )
+    except (BitmexAPIError, CFTCDataError, StablecoinsDataError, FreshnessError) as exc:
+        logger.exception("Monitor data check failed | monitor=%s", monitor)
+        return _record_failed_monitor(
+            monitor=monitor,
+            error=exc,
+            exit_code=1,
+            args=args,
+            state=state,
+            state_file=state_file,
+            logger=logger,
+            utc_now=utc_now,
+            beijing_now=beijing_now,
+            failure_threshold=failure_threshold,
+        )
+    except Exception as exc:
+        logger.exception("Unhandled monitor failure | monitor=%s", monitor)
+        return _record_failed_monitor(
+            monitor=monitor,
+            error=exc,
+            exit_code=1,
+            args=args,
+            state=state,
+            state_file=state_file,
+            logger=logger,
+            utc_now=utc_now,
+            beijing_now=beijing_now,
+            failure_threshold=failure_threshold,
+        )
+
+    if args.dry_run:
+        if result.alert_message:
+            duplicate = get_last_alert_key(state, monitor) == result.alert_key and not args.ignore_state
+            logger.info(
+                "Dry-run alert evaluation | monitor=%s | alert_key=%s | duplicate=%s",
+                monitor,
+                result.alert_key,
+                duplicate,
+            )
+            logger.info("Dry-run Telegram message:\n%s", result.alert_message)
+        return 0
+
+    needs_recovery = record_monitor_success(
+        state,
+        monitor,
+        utc_now,
+        beijing_now,
+        current_value=result.current_value,
+        data_date=result.data_date,
+        metadata=result.metadata,
+    )
+
+    exit_code = 0
+    if needs_recovery:
+        if send_telegram_safely(build_recovery_message(monitor, utc_now, beijing_now), args, logger):
+            mark_recovery_alert_sent(state, monitor, utc_now, beijing_now)
+            logger.info("Recovery notification sent | monitor=%s", monitor)
+        else:
+            logger.error("Recovery notification failed | monitor=%s", monitor)
+            exit_code = 4
+
+    if result.alert_message and result.alert_key:
+        last_alert_key = get_last_alert_key(state, monitor)
+        if last_alert_key == result.alert_key and not args.ignore_state:
+            logger.info(
+                "Alert already sent | monitor=%s | alert_key=%s. Skipping.",
+                monitor,
+                result.alert_key,
+            )
+        elif send_telegram_safely(result.alert_message, args, logger):
+            record_alert_sent(
+                state,
+                monitor,
+                result.alert_key,
+                utc_now,
+                beijing_now,
+                metadata=result.alert_metadata,
+            )
+            logger.info("Alert sent successfully and state updated | monitor=%s", monitor)
+        else:
+            record_monitor_error(
+                state,
+                monitor,
+                utc_now,
+                beijing_now,
+                error="Telegram alert delivery failed.",
+                failure_threshold=failure_threshold,
+            )
+            exit_code = 4
+
+    write_state_atomic(state_file, state, logger)
+    return exit_code
+
+
+def _record_failed_monitor(
+    *,
+    monitor: str,
+    error: Exception,
+    exit_code: int,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    state_file: Path,
+    logger: logging.Logger,
+    utc_now: datetime,
+    beijing_now: datetime,
+    failure_threshold: int,
+) -> int:
+    if args.dry_run:
+        logger.info("Dry-run mode. Failure state not updated | monitor=%s", monitor)
+        return exit_code
+
+    should_alert = record_monitor_error(
+        state,
+        monitor,
+        utc_now,
+        beijing_now,
+        error=error,
+        failure_threshold=failure_threshold,
+    )
+    if should_alert:
+        if send_telegram_safely(build_failure_message(monitor, state, utc_now, beijing_now), args, logger):
+            mark_failure_alert_sent(state, monitor, utc_now, beijing_now)
+            logger.info("Failure notification sent | monitor=%s", monitor)
+        else:
+            logger.error("Failure notification failed | monitor=%s", monitor)
+            exit_code = 4
+
+    write_state_atomic(state_file, state, logger)
+    return exit_code
+
+
+def resolve_log_file() -> Path | None:
+    raw_value = os.getenv("LOG_FILE", "logs/btc_vol_alert.log")
+    if raw_value is None or raw_value.strip() == "":
+        return None
+    return Path(raw_value)
 
 
 def main() -> int:
     args = parse_args()
-    load_dotenv()
+    load_environment()
 
-    log_file = Path(os.getenv("LOG_FILE", "logs/btc_vol_alert.log"))
+    logger = setup_logger(resolve_log_file())
     state_file = Path(os.getenv("STATE_FILE", "state.json"))
-    logger = setup_logger(log_file)
 
     utc_now, beijing_now = get_dual_now()
     logger.info(
@@ -813,12 +1027,16 @@ def main() -> int:
         args.dry_run,
     )
 
-    state = read_state(state_file, logger)
+    state = load_state(state_file, logger)
     exit_codes: list[int] = []
 
     if args.monitor in {"all", "bvol"}:
         exit_codes.append(
-            run_bvol_monitor(
+            execute_monitor(
+                monitor=MONITOR_BVOL,
+                check_func=lambda: check_bvol(
+                    args=args, logger=logger, utc_now=utc_now, beijing_now=beijing_now
+                ),
                 args=args,
                 state=state,
                 state_file=state_file,
@@ -830,7 +1048,11 @@ def main() -> int:
 
     if args.monitor in {"all", "cftc-oi"}:
         exit_codes.append(
-            run_cftc_btc_oi_monitor(
+            execute_monitor(
+                monitor=MONITOR_CFTC_BTC_OI,
+                check_func=lambda: check_cftc_btc_oi(
+                    args=args, logger=logger, utc_now=utc_now, beijing_now=beijing_now
+                ),
                 args=args,
                 state=state,
                 state_file=state_file,
@@ -842,7 +1064,11 @@ def main() -> int:
 
     if args.monitor in {"all", "usdt-supply"}:
         exit_codes.append(
-            run_usdt_supply_monitor(
+            execute_monitor(
+                monitor=MONITOR_USDT_SUPPLY,
+                check_func=lambda: check_usdt_supply(
+                    args=args, logger=logger, utc_now=utc_now, beijing_now=beijing_now
+                ),
                 args=args,
                 state=state,
                 state_file=state_file,

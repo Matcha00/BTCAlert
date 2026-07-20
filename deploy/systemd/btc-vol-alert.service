@@ -1,0 +1,25 @@
+[Unit]
+Description=BTC volatility alert oneshot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=btcalert
+Group=btcalert
+WorkingDirectory=/opt/btc-vol-alert
+EnvironmentFile=/etc/btc-vol-alert.env
+ExecStart=/opt/btc-vol-alert/.venv/bin/python /opt/btc-vol-alert/main.py
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=60s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/btc-vol-alert
+ReadWritePaths=/var/lib/btc-vol-alert
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
