@@ -151,6 +151,12 @@ curl -I -H 'Host: btc.matcha00.xyz' http://127.0.0.1:8502/
 https://btc.matcha00.xyz
 ```
 
+如果 `cloudflared.service` 使用 `--token-file` 运行，public hostname 通常由 Cloudflare Zero Trust 远程管理。本仓库提供了本地参考规则 `deploy/cloudflared/btc-ingress.example.yml`，但真正生效的配置需要在 Cloudflare 控制台把 `btc.matcha00.xyz` 指向现有 tunnel，origin 设置为：
+
+```text
+http://127.0.0.1:8502
+```
+
 ## VSCode Remote SSH
 
 1. VSCode 安装 Remote SSH。
